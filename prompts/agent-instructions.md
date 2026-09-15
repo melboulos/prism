@@ -1,4 +1,4 @@
-# PRISM agent instructions
+# 🔮 PRISM — agent instructions
 
 This is the literal instruction set for the Rox agentflow. It's versioned here so
 changes to PRISM's behavior go through a diff and a review, even though the file

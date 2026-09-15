@@ -1,4 +1,4 @@
-# PRISM — Technical Design Specification
+# 🔮 PRISM — Technical Design Specification
 
 **Version:** 1.0 (V1 scope)
 **Owner:** Mel Boulos (maintainer), Couchbase

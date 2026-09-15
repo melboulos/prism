@@ -1,4 +1,4 @@
-# Rep notification templates (STEP 12)
+# 🔮 PRISM — Rep notification templates (STEP 12)
 
 Sent via `rox_actions.send_notification` to `owning_rep_rox_user_id`. Body format:
 markdown. Cross-reference: [`../docs/design-spec.md`](../docs/design-spec.md) §8.
