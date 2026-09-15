@@ -1,0 +1,63 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/melboulos/prism/schemas/claim-registry-value.schema.json",
+  "title": "PRISM claim registry value",
+  "description": "Schema for the value stored at custom_store key prism:claim:<rox_person_id>, org-scoped. One claim per person; alternates are never claimed. See design-spec.md §5.",
+  "type": "object",
+  "required": [
+    "prism_run_id",
+    "claim_owner_rox_user_id",
+    "claim_owner_name",
+    "claim_status",
+    "claim_timestamp",
+    "fresh_catch_report_id",
+    "pursuit_id"
+  ],
+  "properties": {
+    "prism_run_id": {
+      "type": "string",
+      "pattern": "^prism_[0-9]{8}T[0-9]{6}_[0-9a-f]{8}$",
+      "description": "Format prism_<yyyymmddThhmmss>_<8-hex>, minted at step 1."
+    },
+    "claim_owner_rox_user_id": { "type": "string" },
+    "claim_owner_name": { "type": "string" },
+    "claim_status": {
+      "type": "string",
+      "enum": ["CLAIMED", "SEQUENCE_CREATED", "RELEASED"],
+      "description": "State machine: (no claim) -> CLAIMED (11b) -> SEQUENCE_CREATED (11f), or CLAIMED -> RELEASED on 11c-11f failure (11g). RELEASED is terminal and treated as 'no claim' going forward."
+    },
+    "sequence_campaign_id": {
+      "type": ["string", "null"],
+      "description": "Set at 11f once the paused sequence exists. Null before then."
+    },
+    "sequence_name": {
+      "type": ["string", "null"]
+    },
+    "sequence_status": {
+      "type": ["string", "null"],
+      "enum": ["PAUSED", "ACTIVE", "RESPONDED", "MEETING_BOOKED", "COMPLETED", "STOPPED", null],
+      "description": "Null until claim_status is SEQUENCE_CREATED, then starts at PAUSED."
+    },
+    "claim_timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "fresh_catch_report_id": {
+      "type": "string",
+      "description": "Echoes the triggering payload's report_id, for lineage."
+    },
+    "pursuit_id": {
+      "type": "string",
+      "description": "The primary candidate's pursuit_id (not an alternate's)."
+    },
+    "error_reason": {
+      "type": "string",
+      "description": "Present only when claim_status is RELEASED via the 11g failure path. Free-text error identifier, e.g. create_email_template_failed:wave3."
+    },
+    "cooling_off_until": {
+      "type": "string",
+      "format": "date-time",
+      "description": "V1 reads this field if present (see design-spec.md §5.6) but never writes it. Ownership moves to a future sequence-lifecycle workflow in V2."
+    }
+  }
+}

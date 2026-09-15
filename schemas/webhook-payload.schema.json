@@ -1,0 +1,100 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/melboulos/prism/schemas/webhook-payload.schema.json",
+  "title": "PRISM webhook trigger payload",
+  "description": "Schema for trigger_data.payload as sent by Fresh Catch, one POST per company per rep. See design-spec.md §4.",
+  "type": "object",
+  "required": [
+    "report_id",
+    "company_name",
+    "company_domain",
+    "owning_rep_rox_user_id",
+    "owning_rep_name",
+    "owning_rep_email",
+    "signal_summary",
+    "candidate_contacts"
+  ],
+  "properties": {
+    "report_id": {
+      "type": "string",
+      "description": "Fresh Catch's run_id — company-level lineage key."
+    },
+    "company_name": { "type": "string" },
+    "company_domain": { "type": "string" },
+    "owning_rep_rox_user_id": {
+      "type": "string",
+      "description": "Must equal runtime {{ metadata.user.id }} or PRISM aborts with BLOCKED:rep_mismatch."
+    },
+    "owning_rep_name": { "type": "string" },
+    "owning_rep_email": {
+      "type": "string",
+      "format": "email",
+      "description": "Must equal runtime {{ metadata.user.email }}, case-insensitive."
+    },
+    "signal_summary": {
+      "type": "string",
+      "description": "Fresh Catch's summary of why the company surfaced."
+    },
+    "candidate_contacts": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 3,
+      "items": { "$ref": "#/$defs/candidateContact" }
+    },
+    "rox_company_id": {
+      "type": "string",
+      "description": "Optional. Skips domain lookup if Fresh Catch already resolved the account."
+    },
+    "test": {
+      "type": "boolean",
+      "description": "Optional. If truthy: run diagnostic only, no claim/sequence writes."
+    },
+    "signal_sources": {
+      "type": "array",
+      "items": { "type": "string", "format": "uri" },
+      "description": "Optional. Fresh Catch's dated citations."
+    },
+    "signal_type": {
+      "type": "string",
+      "description": "Optional. Fresh Catch's classification, e.g. product_launch, funding."
+    },
+    "fresh_catch_couchbase_angle": {
+      "type": "string",
+      "description": "Optional. Prior category-level Couchbase angle. Treat as prior work, not gospel."
+    },
+    "fresh_catch_call_opener": {
+      "type": "string",
+      "description": "Optional. Prior suggested opener. Same treatment as fresh_catch_couchbase_angle."
+    }
+  },
+  "$defs": {
+    "candidateContact": {
+      "type": "object",
+      "required": ["pursuit_id", "name"],
+      "anyOf": [
+        { "required": ["email"] },
+        { "required": ["linkedin_slug"] }
+      ],
+      "properties": {
+        "pursuit_id": {
+          "type": "string",
+          "pattern": "^fc-[0-9]{8}-[a-z]+-[0-9a-f]{6}$",
+          "description": "Fresh Catch's stable per-contact key, format fc-YYYYMMDD-{initials}-{6-hex}. PRISM promotes the selected primary's pursuit_id to its claim."
+        },
+        "name": { "type": "string" },
+        "email": { "type": "string", "format": "email" },
+        "linkedin_slug": { "type": "string" },
+        "rox_person_id": {
+          "type": "string",
+          "description": "Optional. If Fresh Catch already resolved the person in Rox."
+        },
+        "title": { "type": "string" },
+        "phone": { "type": "string" },
+        "is_fresh_catch_primary": {
+          "type": "boolean",
+          "description": "Optional. Fresh Catch's own primary guess. Advisory only — PRISM can override it in step 7."
+        }
+      }
+    }
+  }
+}
