@@ -210,27 +210,30 @@ Avoid: marketing jargon, buzzwords, generic AI language, exaggerated enthusiasm,
 fake familiarity, "just following up," forced product pitches. The recipient
 should think: "Huh. That's an interesting observation."
 
-Verified example from run `7bf0506b` (Sam Aarons at Modern Treasury) — use this as
-the calibration bar when writing or reviewing a Wave 1 draft:
+Illustrative example (synthetic — no real prospect, company, or research
+citation; run `7bf0506b` validated the pipeline end-to-end, but its actual Wave 1
+content is customer-identifying and is intentionally not reproduced here). Use
+this shape as the calibration bar when writing or reviewing a Wave 1 draft:
 
-> Subject: FedNow, finality, and reconciliation
+> Subject: Idempotency at the boundary
 >
-> Sam — Your point that FedNow isn't just faster ACH — the real shift is final,
-> irreversible, real-time money movement — stuck with me. I also saw that you
-> pushed for a receiver-side change in the Fed working group to make incoming
-> payments easier to reconcile.
+> Alex — Your point that the double-charge incident came from a retry storm
+> without idempotency keys, not from the payment provider itself, stuck with me.
+> That's a distinction most teams get wrong until it costs them.
 >
-> As instant fiat rails and stablecoins become one "coherent execution surface,"
-> I'm curious where state consistency gets hardest: at the rail boundary, in the
-> ledger, or in the exception paths between them?
+> As you've scaled that pattern, I'm curious where you've ended up drawing the
+> line: idempotency enforced at the API layer, or pushed down into the
+> queue/consumer boundary?
 >
 > I'd value your perspective if you're open to a short conversation.
 >
 > Best, Mel
 
-Passes all 6 Personal Selling Test checks: specific to Sam (not the company),
-demonstrates real research (FedNow working group), poses a genuine question, no
-product pitch, no creepy trivia.
+Passes all 6 Personal Selling Test checks: specific to Alex (not the company),
+demonstrates a real point of research (the incident and its root cause), poses a
+genuine question, no product pitch, no creepy trivia. A real Wave 1 draft should
+hit this same bar with the specific person's actual signal in place of the
+placeholder incident above.
 
 ## Tool inventory this agentflow should have attached
 

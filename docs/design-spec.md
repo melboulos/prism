@@ -430,10 +430,11 @@ Avoid: marketing jargon, buzzwords, generic AI language, exaggerated enthusiasm,
 fake familiarity, "just following up," forced product pitches. The recipient
 should think: "Huh. That's an interesting observation."
 
-Verified example from run `7bf0506b` (Sam Aarons at Modern Treasury) is preserved
-in [`prompts/agent-instructions.md`](../prompts/agent-instructions.md) §15 as a
-worked reference, since it's the calibration example the agent should be graded
-against.
+A synthetic calibration example is preserved in
+[`prompts/agent-instructions.md`](../prompts/agent-instructions.md) §15 as a
+worked reference the agent should be graded against. Run `7bf0506b` validated
+that PRISM's actual output clears this bar, but its real Wave 1 content is
+customer-identifying and is intentionally not reproduced in either document.
 
 ## 16. What PRISM V1 is NOT
 
