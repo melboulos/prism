@@ -1,478 +1,539 @@
-# 🔮 PRISM — Technical Design Specification
+# 🔮 PRISM — Technical Design Spec
 
-**Version:** 1.0 (V1 scope)
-**Owner:** Mel Boulos (maintainer), Couchbase
-**Deployed as:** Shared Rox Agentflow, per-rep webhook instance
-**Status:** Live, validated end-to-end (workflow run `7bf0506b`, 2026-09-14)
+**Version:** 1.0
+**Owner:** Mel Boulos
+**Runtime:** Rox agentflow
 
-## 1. Purpose
+## 1. Overview
 
-PRISM turns a Fresh Catch signal about a company into a ready-to-activate personal
-selling conversation with one specific person. It:
+PRISM is an LLM agentflow that turns a detected sales signal into a credible Couchbase AE-authored outreach conversation — or explicitly refuses to produce one. It is not an email generator. It is a decision system whose primary output is whether to open a conversation, secondarily what conversation to open, and only lastly the specific email that opens it.
 
-1. Receives a per-company POST from Fresh Catch with 2–3 candidate contacts.
-2. Resolves each candidate in Rox, checks a global claim registry for
-   duplicate-outreach protection, and screens for per-candidate eligibility.
-3. Researches company, signal, Couchbase footprint, and each eligible candidate in
-   parallel.
-4. Selects one primary contact using role fit, signal proximity, personal evidence
-   depth, and seniority match.
-5. Drafts a Wave 1 discovery email under a strict Personal Selling Test.
-6. Authors 5 email templates (Wave 1 real, Waves 2–5 placeholders), creates a
-   paused 5-step Rox Sequence, enrolls only the primary, and writes a global claim
-   so no other PRISM run duplicates the outreach.
-7. Notifies the owning rep with a concise sequence-ready summary; writes a full
-   shadow diagnostic to the maintainer's Home.
+**Inputs:** a webhook POST from an upstream detection agent (Fresh Catch) containing a company, a signal, and 2–3 candidate contacts.
 
-PRISM never sends email. Every sequence it creates is **PAUSED**.
+**Outputs:** either (a) a PAUSED 5-step Rox sequence enrolled to one primary contact with an AI-authored Wave 1, ready for human review and send; or (b) a HOLD/BLOCKED/ERROR decision with a structured diagnostic. PRISM never sends email autonomously.
 
-## 2. Position in the Fresh Catch → PRISM → Pursue flow
+**Core design constraint:** token expenditure must increase only as confidence increases. Cheap deterministic checks precede LLM reasoning. Deep research runs on the leading candidate only. The email is drafted only after commercial viability is validated. HOLD is a first-class outcome, not a failure state.
 
-| Stage | Owns | Cadence | Output |
-|---|---|---|---|
-| 🎣 Fresh Catch | Detection: signal + candidate contacts | M/W/F | Lookalike Prospect leads, one webhook POST per company per rep |
-| 🔮 PRISM | Interpretation: primary selection + Wave 1 + paused sequence | Per POST | One paused Rox Sequence + one rep notification + one diagnostic |
-| 🎯 Pursue | Human conversion: rep activation and reply handling | Rep-driven | Real outreach, conversations, meetings |
+## 2. System Context
 
-The `pursuit_id` (Fresh Catch-generated, per candidate, format
-`fc-YYYYMMDD-{initials}-{6-hex}`) is the join key that stitches all three stages.
-
-## 3. Runtime type and multi-tenant deployment
-
-**Runtime type:** Rox agentflow (LLM agent with tool access; no step DAG).
-**Trigger:** webhook (unauthenticated in V1 — see §12 for hardening plan).
-**Deployment model:** PRISM is a shared workflow. The maintainer (Mel) owns the
-definition. Each rep enables their own instance in Rox, which generates a per-rep
-webhook URL.
-
-**Rep webhook map:** Fresh Catch resolves the target URL via an org-scoped
-`custom_store` map, key `prism_webhooks_by_rep`:
-
-```json
-{ "rep.email@couchbase.com": "https://webhooks.backend.rox.com/webhooks/w/<slug>", ... }
+```
+┌──────────────┐   webhook    ┌──────────────┐   paused seq    ┌──────────────┐
+│ 🎣 Fresh     │─────────────▶│ 🔮 PRISM     │────────────────▶│ 🎯 Pursue    │
+│    Catch     │              │  (this doc)  │                 │  (human)     │
+└──────────────┘              └──────────────┘                 └──────────────┘
+      │                              │
+      │                              │ reads/writes
+      ▼                              ▼
+   Detects signals         ┌─────────────────────┐
+   Discovers candidates    │ Rox custom_store    │
+   Assigns pursuit_ids     │ - claim registry    │
+                           │ - wave templates    │
+                           │ - company research  │
+                           │ - webhook routing   │
+                           └─────────────────────┘
+                                     ▲
+                                     │ writes wave 2–5 template ids
+                                     │
+                           ┌─────────────────────┐
+                           │ 🛠️ PRISM Bootstrap  │
+                           │ (maintainer-run)    │
+                           └─────────────────────┘
 ```
 
-Keys are lowercased rep emails. Maintained via the Custom Store Editor workflow
-(same pattern as `support_by_rep`).
+### External contracts
 
-**Onboarding cost per rep:** rep enables PRISM (URL is auto-generated) → maintainer
-adds one entry to the map. Reps not in the map get no PRISM handoff; their Fresh
-Catch brief still ships normally.
-
-### 3.1 Runtime identity invariants
-
-Each PRISM run executes as the rep who enabled the instance that received the POST.
-Consequences:
-
-| Concern | Behavior |
-|---|---|
-| `{{ metadata.user.* }}` | Resolves to the executing rep, not the maintainer. |
-| RQL reads | Governed by the executing rep's data access. |
-| `send_notification` | Delivered to the executing rep. |
-| `add_html` | Writes to the workflow-owner's Home (maintainer), regardless of executing rep. |
-
-**Invariant PRISM must enforce:** `trigger_data.payload.owning_rep_rox_user_id ==
-{{ metadata.user.id }}` AND `owning_rep_email == {{ metadata.user.email }}`
-(case-insensitive). If either mismatches, PRISM aborts with `BLOCKED:rep_mismatch`
-and records both identities in the diagnostic. This catches Fresh Catch routing bugs.
-
-## 4. Trigger contract (webhook payload schema)
-
-The webhook body arrives at `trigger_data.payload`. Fresh Catch produces one POST
-per company per rep. See [`schemas/webhook-payload.schema.json`](../schemas/webhook-payload.schema.json)
-for the machine-readable contract.
-
-### 4.1 Required fields
-
-| Field | Type | Notes |
+| System | Role | Interface |
 |---|---|---|
-| `report_id` | string | Fresh Catch's run_id — company-level lineage key |
-| `company_name` | string | |
-| `company_domain` | string | |
-| `owning_rep_rox_user_id` | string | Must equal runtime `{{ metadata.user.id }}` |
-| `owning_rep_name` | string | |
-| `owning_rep_email` | string | Must equal runtime `{{ metadata.user.email }}` (case-insensitive) |
-| `signal_summary` | string | Fresh Catch's summary of why the company surfaced |
-| `candidate_contacts` | list[obj] | 1–3 entries; each entry as below |
+| Fresh Catch | Signal detection, candidate discovery, compliance/DNC screening | POSTs `PrismWebhookPayload` (§6.1) to per-AE PRISM webhook URLs |
+| PRISM Bootstrap | Creates the four prebuilt email templates (Waves 2–5) and writes their IDs atomically | Writes org `custom_store` key `prism:wave_template_ids` (§6.2) |
+| Pursue | Human-driven follow-up motion after enrollment | Reads `pursuit_id` from PRISM's claim record; PRISM does not integrate with Pursue directly |
+| Rox platform | Workflow runtime, custom_store, RQL, email templates, campaigns, notifications, Home diagnostics | Rox actions catalog (§9) |
 
-### 4.2 Optional fields
+## 3. Design Principles
 
-| Field | Type | Purpose |
-|---|---|---|
-| `rox_company_id` | string | Skips domain lookup if Fresh Catch already resolved |
-| `test` | bool | If truthy: run diagnostic only, no claim/sequence writes |
-| `signal_sources` | list[url] | Fresh Catch's dated citations |
-| `signal_type` | string | Fresh Catch's classification (e.g. `product_launch`, `funding`) |
-| `fresh_catch_couchbase_angle` | string | Prior category-level Couchbase angle. Treat as prior work, not gospel. |
-| `fresh_catch_call_opener` | string | Prior suggested opener. Same treatment. |
+Four principles govern every architectural decision in this system.
 
-### 4.3 Candidate contact object
+### 3.1 If there is nothing genuinely worth saying, say nothing
 
-| Field | Type | Notes |
-|---|---|---|
-| `pursuit_id` | string, required | Fresh Catch's stable per-contact key; PRISM promotes the selected primary's to its claim |
-| `name` | string | |
-| `email` OR `linkedin_slug` | string | At least one required per candidate |
-| `rox_person_id` | string, optional | If Fresh Catch already resolved |
-| `title`, `phone` | string, optional | |
-| `is_fresh_catch_primary` | bool, optional | Fresh Catch's own primary guess. Advisory only. |
+HOLD is a first-class outcome. A well-reasoned HOLD is more valuable to the AE than a manufactured sequence. The system is optimized for quality of conversation, not number of touches.
 
-### 4.4 Validation
+### 3.2 Token expenditure must increase only as confidence increases
 
-If `report_id`, `owning_rep_rox_user_id`, `signal_summary`, `company_domain`, or a
-non-empty `candidate_contacts` list is missing — or any candidate lacks
-`pursuit_id` — PRISM records `BLOCKED:missing_required_payload_field:<name>` and
-stops after writing the diagnostic. No claim or sequence side effects.
+The pipeline is a strict funnel of increasing token cost:
 
-## 5. Global Lead Protection: the claim registry
+```
+Payload validation      ─── zero LLM
+Deterministic eligibility ── zero LLM
+Cheap triage           ─── 1 LLM call, no research
+Company research (cached) ─ 0 or 1 research call, TTL 30 days
+Deep person research   ─── 1 batched research call on #1 only, max 2 per run
+Conversation Plan      ─── 1 LLM call (only if research passed)
+Commercial evaluator   ─── 1 LLM call (validates the plan)
+Wave 1 draft           ─── 1 LLM call (only if plan passed)
+Email evaluator        ─── 1 LLM call + max 1 rewrite (only if draft exists)
+```
 
-### 5.1 Purpose
+No stage runs until the previous one has justified it. HOLD terminates the pipeline immediately; no "try a different approach" beyond one narrowly-scoped fall-through rule during person research.
 
-The claim registry is the source of truth for "PRISM is already working this
-person." It prevents duplicate outreach across:
+### 3.3 AE-authored, not SE-authored
 
-- Multiple PRISM runs firing near-simultaneously for the same person
-- Different reps' PRISM instances landing on the same candidate
-- The same rep re-triggering on the same person before finishing
+The executing rep is a Couchbase Account Executive. Wave 1 reads as an AE writing to another human: technically credible, but not diagnosing the customer's architecture and not pitching product. SE involvement is a later-conversation possibility that Wave 1 sets up, never an identity Wave 1 assumes. SE-only enablements are explicitly out of scope.
 
-### 5.2 Storage
+### 3.4 The successful commercial chain
 
-**Backend:** Rox `custom_store`, org-scoped.
-**Key pattern:** `prism:claim:<rox_person_id>` — one claim per person. Alternates
-are NEVER claimed.
-**Value schema:** see [`schemas/claim-registry-value.schema.json`](../schemas/claim-registry-value.schema.json).
+Every ENROLLED run establishes:
+
+```
+person-specific evidence
+  → current problem
+    → Couchbase-relevant problem
+      → legitimate AE reason for contact
+        → diagnostic question
+          → expected response
+            → next conversation
+              → SE handoff when appropriate
+```
+
+If that chain cannot be established honestly, the run holds.
+
+## 4. Deployment Architecture
+
+### 4.1 Multi-tenant shared workflow
+
+PRISM is one workflow definition shared across an org. Each AE enables their own instance, which:
+
+- Runs as that AE (`{{ metadata.user.* }}` resolves to them)
+- Governs all RQL reads by their data access
+- Generates a per-AE webhook URL
+- Delivers rep notifications to them
+
+The workflow owner (the maintainer) receives shadow diagnostics on their Home regardless of which AE's instance ran — because Rox's `add_html` writes to the workflow owner's Home, not the executing user's.
+
+### 4.2 Routing map
+
+Fresh Catch resolves the invoking AE to a PRISM webhook via the org-scoped `custom_store` key `prism_webhooks_by_rep`:
+
+```json
+{
+  "ae.email@couchbase.com": "https://webhooks.backend.rox.com/webhooks/w/<slug>",
+  ...
+}
+```
+
+Keys are lowercased AE emails. Values are per-AE PRISM webhook URLs. PRISM does not read this map — it is a webhook receiver; whoever POSTed to its URL has already resolved routing.
+
+**Onboarding:** AE enables PRISM → Rox generates their URL → maintainer adds one map entry → Fresh Catch begins routing signals for that AE.
+
+### 4.3 Identity invariant
+
+At runtime, PRISM enforces:
+
+```
+payload.owning_rep_rox_user_id == metadata.user.id
+payload.owning_rep_email       == metadata.user.email (case-insensitive)
+```
+
+If either mismatches, Fresh Catch has POSTed to the wrong AE's instance. Abort with `BLOCKED:rep_mismatch` and record both identities in the diagnostic. This guards against misconfigured routing map entries.
+
+## 5. The Pipeline
+
+13 sequential steps. Each has a terminal state; the only intra-run backtracking is the deterministic fall-through in Step 6.
+
+| # | Stage | LLM calls | External calls | Terminal outcomes |
+|---|---|---|---|---|
+| 1 | Payload validation + preflight | 0 | 1 `custom_store_get` | `BLOCKED:rep_mismatch`, `BLOCKED:missing_required_payload_field:*`, `BLOCKED:missing_wave_template_config:*` |
+| 2 | Deterministic eligibility | 0 | N × `custom_store_get`, `lookup_account_by_domain`, `find_contact`/`create_contact`, RQL, `email.list_emails` | `HOLD:account_unresolved`, `HOLD:all_candidates_unresolved`, `HOLD:all_candidates_ineligible`, `ALREADY_WORKED` |
+| 3 | Cheap candidate triage | 1 | 0 | Produces `ranked_candidates` and `triage_selection` |
+| 4 | Company research (cached, 30-day TTL) | 0 or 1 | 1 `custom_store_get`, 0 or 1 `custom_store_set` | Cache HIT or MISS |
+| 5 | Deep person research on `ranked_candidates[0]` | 1 batched call (person research + Couchbase RQL) | RQL | Produces Person research object + `couchbase_relationship` |
+| 6 | Interpret `research_result` classifier | 0 or 1 (fall-through) | RQL (reused) | PASS → step 7; `HOLD:insufficient_signal`, `HOLD:conflicting_evidence`, `HOLD:research_tool_failure`, `HOLD:insufficient_research_all_candidates_tried` |
+| 7 | Compact research summary + Conversation Plan | 1 | 0 | `HOLD:plan_construction_failed:*` |
+| 8 | Commercial viability evaluator (11 gates) | 1 | 0 | `HOLD:commercial_viability_failed:<gate>` |
+| 9 | Draft Wave 1 | 1 | 0 | Produces Wave 1 draft |
+| 10 | Email quality evaluator (20 gates) + max 1 rewrite | 1 or 2 (plus 1 draft on rewrite) | 0 | `HOLD:email_quality_failed:<gate>` |
+| 11 | Atomic claim + template + enroll | 0 | `custom_store_get`/`set`, `create_email_template`, `create_campaign`, `add_contact_to_campaign` | `ENROLLED`, `ALREADY_WORKED` (11a race), `ERROR:*` |
+| 12 | Notify (AE + maintainer copy) | 0 | 1–2 `send_notification` | Notifications sent or silent per outcome |
+| 13 | Shadow diagnostic to maintainer Home | 0 | 1 `add_html` | Always fires |
+
+**Terminal state discipline.** Each stage either promotes to the next or terminates. The only exception is Step 6's controlled fall-through to `ranked_candidates[1]` on person-specific classifier failures. Nothing else "tries a different approach" — no adaptive retry, no re-reasoning, no alternate generation strategy.
+
+**Hard ceilings:**
+
+- Max 2 deep-research operations per run, ever. `ranked_candidates[2]` is never researched.
+- Max 1 rewrite on Wave 1. Second failure → HOLD.
+- Max 1 retry on any deterministic tool error. Second failure → move to diagnostic.
+
+**Root-cause note carried forward from v1.0 pre-release validation** (workflow runs `dbb1971a`, `e9715769`, fixed and confirmed clean in `7bf0506b`): Rox's templated step types (`manual_email`, `email`, `automated_email`) copy their body from a linked email template — `user_input` is ignored for these step types and a step created without a linked `template_id` silently produces `steps_created: 0`. Step 11 (§9, §11.7 below) enforces `create_email_template` before `create_campaign`, with the returned `template_id` linked on every step, specifically to prevent regression of this bug.
+
+## 6. Data Contracts
+
+### 6.1 Webhook payload (`PrismWebhookPayload`)
+
+```json
+{
+  "report_id": "string, required — Fresh Catch's run_id (company-level lineage)",
+  "test": "bool, optional — if true, skip claim/sequence, diagnostic only",
+
+  "rox_company_id": "uuid, optional — if Fresh Catch resolved",
+  "company_name": "string, required",
+  "company_domain": "string, required",
+
+  "owning_rep_rox_user_id": "uuid, required (identity invariant)",
+  "owning_rep_name": "string, required",
+  "owning_rep_email": "string, required (identity invariant, case-insensitive)",
+
+  "signal_summary": "string, required",
+  "signal_sources": ["url", "..."],
+  "signal_type": "string, optional",
+  "fresh_catch_couchbase_angle": "string, optional — prior work, not gospel",
+  "fresh_catch_call_opener": "string, optional — prior work, not gospel",
+
+  "candidate_contacts": [
+    {
+      "pursuit_id": "string, required per candidate — format fc-YYYYMMDD-{initials}-{6-hex}",
+      "rox_person_id": "uuid, optional",
+      "name": "string",
+      "email": "string",
+      "linkedin_slug": "string",
+      "title": "string",
+      "phone": "string",
+      "is_fresh_catch_primary": "bool, optional — advisory only"
+    }
+  ]
+}
+```
+
+**Validation rules:**
+
+- `report_id`, `owning_rep_rox_user_id`, `signal_summary`, `company_domain`, non-empty `candidate_contacts` are required
+- Each candidate needs `pursuit_id` and (`email` OR `linkedin_slug`)
+- Any missing required field → `BLOCKED:missing_required_payload_field:<name>`
+
+### 6.2 Custom store keys
+
+| Key | Scope | Writer | Reader | Purpose |
+|---|---|---|---|---|
+| `prism_webhooks_by_rep` | org | maintainer (manual) | Fresh Catch | Route AE → PRISM webhook URL |
+| `prism:wave_template_ids` | org | PRISM Bootstrap | PRISM (Step 1 preflight) | Waves 2–5 template IDs |
+| `prism:claim:<rox_person_id>` | org | PRISM (Steps 11b, 11f, 11g) | PRISM (Steps 2, 11a), other PRISM instances | Global lead protection registry |
+| `prism:company_research:<domain>` | org | PRISM (Step 4 MISS) | PRISM (Step 4) | Company background cache, 30-day TTL |
+
+### 6.3 Claim registry schema
 
 ```json
 {
   "prism_run_id": "prism_<yyyymmddThhmmss>_<8-hex>",
-  "claim_owner_rox_user_id": "…",
-  "claim_owner_name": "…",
+  "claim_owner_rox_user_id": "uuid",
+  "claim_owner_name": "string",
   "claim_status": "CLAIMED | SEQUENCE_CREATED | RELEASED",
-  "sequence_campaign_id": "<id>" | null,
-  "sequence_name": "<name>" | null,
-  "sequence_status": "PAUSED | ACTIVE | RESPONDED | MEETING_BOOKED | COMPLETED | STOPPED" | null,
-  "claim_timestamp": "<iso8601>",
-  "fresh_catch_report_id": "…",
-  "pursuit_id": "<primary_pursuit_id>",
-  "error_reason": "<string>"
+  "sequence_campaign_id": "uuid | null",
+  "sequence_name": "string | null",
+  "sequence_status": "PAUSED | ACTIVE | RESPONDED | MEETING_BOOKED | COMPLETED | STOPPED | null",
+  "claim_timestamp": "iso8601",
+  "fresh_catch_report_id": "string",
+  "pursuit_id": "string — primary's pursuit_id",
+  "error_reason": "string | absent"
 }
 ```
 
-`error_reason` is present only after the 11g release path.
+**Invariants:**
 
-### 5.3 Interpretation rules (step 4 of the algorithm)
+- One claim per `rox_person_id`. Alternates are never claimed.
+- Only the primary is enrolled. Alternates remain available for other motions.
+- State transitions: `AVAILABLE → CLAIMED → SEQUENCE_CREATED`, or `CLAIMED → RELEASED` on any failure after Step 11b.
+- PRISM only writes `PAUSED` for `sequence_status`. Other values are readable but written by future companion workflows.
+- **Concurrency limitation:** `custom_store_set` is check-then-set, not compare-and-swap. Two PRISM runs firing within milliseconds could both write. Mitigated by (a) recheck at Step 11a, (b) writing claim BEFORE creating template or sequence, so a lost race releases cleanly.
 
-| Claim state | Meaning for a candidate |
+### 6.4 Company research cache
+
+```json
+{
+  "researched_at": "iso8601 — sole source of truth for TTL",
+  "domain": "string",
+  "prism_run_id_source": "string",
+  "current_initiatives": [{"claim": "...", "source": "...", "date": "..."}],
+  "architecture_signals": ["..."],
+  "hiring_signals": ["..."],
+  "strategic_priorities": ["..."],
+  "known_couchbase_footprint": "string or 'none found'",
+  "background_summary": "2–4 line prose"
+}
+```
+
+**Cache-corroboration rule:** cached facts may inform prompts but may NEVER be cited as current evidence in Wave 1 or the Conversation Plan without corroboration from Fresh Catch's `signal_summary`/`signal_sources` OR current person research. On conflict, current signal wins.
+
+### 6.5 Person research object
+
+```json
+{
+  "pursuit_id": "carried",
+  "rox_person_id": "carried",
+  "person_role_relevance": "one line",
+  "current_initiative": "one line",
+  "recent_signal": "one line — cited public evidence",
+  "technical_tension": "one line",
+  "business_impact": "one line",
+  "couchbase_relevance": "one line or 'none credible yet'",
+  "evidence": [{"fact": "...", "source": "...", "date": "..."}],
+  "confidence": "HIGH | MEDIUM | LOW",
+  "research_result": "PASS | INSUFFICIENT_PERSON_EVIDENCE | INSUFFICIENT_CURRENT_SIGNAL | INSUFFICIENT_ROLE_RELEVANCE | INSUFFICIENT_COUCHBASE_RELEVANCE | CONFLICTING_EVIDENCE"
+}
+```
+
+### 6.6 Research result classifier semantics (Step 6)
+
+| Classifier | Category | Fall-through action |
+|---|---|---|
+| `PASS` | Success | Lock candidate as primary → Step 7 |
+| `INSUFFICIENT_PERSON_EVIDENCE` | Person-specific failure | Fall through to `ranked_candidates[1]` if exists |
+| `INSUFFICIENT_ROLE_RELEVANCE` | Person-specific failure | Fall through to `ranked_candidates[1]` if exists |
+| `INSUFFICIENT_COUCHBASE_RELEVANCE` | Person-specific failure | Fall through to `ranked_candidates[1]` if exists |
+| `INSUFFICIENT_CURRENT_SIGNAL` | Structural/premise failure | HOLD — different person won't fix a broken premise |
+| `CONFLICTING_EVIDENCE` | Structural/premise failure | HOLD — do not paper over conflicting facts |
+| (tool error × 2) | Hard-deterministic failure | `HOLD:research_tool_failure` — no fall-through |
+
+The person-specific/structural distinction is the deterministic contract that keeps fall-through bounded to a single candidate and prevents wasted research when the underlying signal itself is bad.
+
+### 6.7 Conversation Plan
+
+The commercial-reasoning artifact. 16 fields, produced in Step 7 for the locked primary only.
+
+```json
+{
+  "person": {"name": "", "pursuit_id": "", "rox_person_id": ""},
+  "current_signal": "restated in one line",
+  "why_now": "why this signal makes the question relevant now",
+  "person_specific_evidence": [{"fact": "", "source": "", "date": ""}],
+  "role_relevance": "why THIS person's responsibilities intersect the signal",
+
+  "problem_to_confirm": "the SINGLE problem the recipient can confirm/deny/clarify",
+  "business_technical_tension": "why it matters commercially or technically",
+
+  "couchbase_relevant_problem": "problem restated in terms Couchbase would recognize",
+  "couchbase_entry_point": "architecturally specific reason Couchbase is relevant (NOT 'distributed systems', 'data', 'scalability', 'AI', 'modern architecture')",
+  "why_couchbase": "connection from problem to Couchbase capability",
+
+  "ae_reason_for_contact": "why a Couchbase AE specifically — not equally a consultant/SE/analyst/vendor",
+  "ae_positioning": "soft context ('I work with teams dealing with this class of problem')",
+
+  "question": "the exact diagnostic question — YES/NO/SOMETHING DIFFERENT answerable",
+  "expected_response": {"likely_answer": "", "why_it_matters": ""},
+
+  "next_step_if_yes": "real conversation move, not 'ask for a meeting'",
+  "next_step_if_no": "what the AE asks or learns next — do not abandon",
+  "next_step_if_different": "follow the newly revealed problem without forcing the original",
+
+  "se_handoff_trigger": "condition under which an SE could add value later",
+  "research_to_question_trace": "evidence → problem → Couchbase → question chain"
+}
+```
+
+Every field must be supported by the compact research summary or explicitly marked as an inference. The Plan is the philosophical center of the redesign: we validate the thinking here before spending tokens on the prose.
+
+## 7. Gates and Evaluators
+
+Two evaluators, run in sequence. The commercial evaluator validates the reasoning; the email evaluator validates the prose. Splitting them is deliberate: plan-level failures cost less to detect at plan time than after drafting.
+
+### 7.1 Commercial viability gates (Step 8, 11 gates)
+
+Evaluated against the Conversation Plan. Failure → HOLD immediately (no rewrite budget; re-planning the same facts won't produce a different plan).
+
+| Gate | Checks |
 |---|---|
-| No claim, or `RELEASED` | AVAILABLE |
-| `CLAIMED` | CLAIMED_ELSEWHERE — ineligible |
-| `SEQUENCE_CREATED` with `sequence_status` ∈ {PAUSED, ACTIVE, RESPONDED, MEETING_BOOKED} | CLAIMED_ELSEWHERE — ineligible |
-| `SEQUENCE_CREATED` with `sequence_status` ∈ {COMPLETED, STOPPED} and `cooling_off_until` in future | COOLING_OFF — ineligible |
-| `SEQUENCE_CREATED` with `sequence_status` ∈ {COMPLETED, STOPPED} and cooling_off expired or absent | AVAILABLE |
+| `V_COUCHBASE_CONVERSATION_PATH` | Confirmation creates a real commercial conversation, not just an interesting chat |
+| `V_COUCHBASE_ENTRY_POINT` | Architecturally specific, not generic |
+| `V_WHY_COUCHBASE` | Real problem → Couchbase capability connection, not generic vendor claim |
+| `V_AE_REASON_FOR_CONTACT` | Legitimate for a Couchbase AE specifically |
+| `V_QUESTION_DIAGNOSES_PROBLEM` | Question diagnoses the single problem, not abstract architecture opinion |
+| `V_NO_DEAD_END` | Yes/no/different each create real, distinct conversation moves |
+| `V_SE_HANDOFF_TRIGGER` | Credible technical follow-up condition exists |
+| `V_RESEARCH_TO_QUESTION_TRACE` | Evidence → problem → Couchbase → question logically holds |
+| `V_WHY_THIS_PERSON` | Question doesn't equally fit another executive at the same company |
+| `V_WHY_NOW` | Current signal creates a real present-tense reason |
+| `V_CONVERSATION_VALUE` | Recipient's answer materially changes next action |
 
-### 5.4 State machine
+Evaluator output:
 
-```
-                     ┌────────────────┐
-   (no claim) ─────► │    CLAIMED     │  (step 11b)
-                     └─────┬──────────┘
-                           │
-                           ▼
-                    ┌───────────────────┐
-                    │  SEQUENCE_CREATED │  (step 11f)
-                    └─────┬─────────────┘
-                          │
-                          ▼
-                    ┌────────────┐
-                    │  RELEASED  │  ◄──── failure between 11c–11f (step 11g)
-                    └────────────┘
+```json
+{
+  "pass": true,
+  "failed_gates": [{"gate": "V_*", "reason": "one line"}],
+  "notes": "string | null"
+}
 ```
 
-`RELEASED` is a terminal state and is treated as "no claim" for future runs.
-Preserved for audit trail; never deleted.
+Passing gates get no prose. Failed gates get one line of "why". Never enumerate PASS.
 
-### 5.5 V1 concurrency limitation (documented in every diagnostic)
+### 7.2 Email quality gates (Step 10, 20 gates)
 
-`custom_store_set` is check-then-set, not compare-and-swap. Two PRISM runs firing
-within milliseconds for the same person could both write `CLAIMED`. In practice
-this is rare (single-rep-per-instance, Fresh Catch M/W/F cadence, one company per
-POST). Documented; V2 will move to a CAS primitive.
+Evaluated against the drafted Wave 1 with the approved Plan as reference. Failure → 1 rewrite (must still express the same Plan) → HOLD.
 
-### 5.6 Cooling-off — V1 scope
+Original 18 human-quality gates (`PERSONAL_RESEARCH_GATE`, `RESPONSE_WORTHINESS_GATE`, `EASY_REPLY_GATE`, `RECIPIENT_PERSPECTIVE_GATE`, `I_TOOK_THE_TIME_TEST`, `HUMAN_GATE`, `KINDNESS_GATE`, `SINCERITY_GATE`, `SPECIFICITY_GATE`, `INSIGHT_GATE`, `NO_FLUFF_GATE`, `NON_SALESY_GATE`, `ONE_IDEA_GATE`, `TRUTH_GATE`, `ROLE_RELEVANCE_GATE`, `FRESHNESS_GATE`, `THREAD_AWARENESS_GATE`, `PERSONAL_SELLING_TEST`) plus two commercial-craft gates:
 
-V1 recognizes cooling-off if `cooling_off_until` is present and in the future. V1
-never writes it. That's a V2 concern owned by a future sequence-lifecycle workflow
-that will react to Rox sequence `COMPLETED`/`STOPPED` events.
-
-## 6. Execution algorithm
-
-See [`prompts/agent-instructions.md`](../prompts/agent-instructions.md) for the
-full, runnable version of the 13-step algorithm — this section is the narrative
-summary; that file is the literal instructions pasted into the Rox agentflow.
-
-## 7. The enrollment protocol (STEP 11) — canonical order
-
-The most subtle part of PRISM. Order matters because it prevents both race
-conditions and orphaned state. Full detail, including the exact tool call shapes,
-lives in [`prompts/agent-instructions.md`](../prompts/agent-instructions.md) §11.
-
-### 7.1 Sequence step configuration — non-negotiable
-
-All three templated `step_type` values in Rox (`email`, `manual_email`,
-`automated_email`) copy their body from a linked email template. The step's
-`user_input` is IGNORED for these types. Consequence:
-
-| Field on step | Value | Rationale |
-|---|---|---|
-| `step_type` | `"manual_email"` | Templated, PAUSED, rep manually reviews and sends |
-| `templates` | `[<template_id>]` (exactly one) | Body source. A step without a template silently drops. |
-| `is_automatic_enabled` | `false` | Belt-and-suspenders alongside campaign-level pause |
-| `user_input` | UNSET | Ignored for templated step types; setting it just confuses diagnostics |
-| `generation_type` | UNSET | Default is correct. Setting `"agent"` would let runtime AI rewrite the body at send time. |
-| `step_subject_line` | UNSET | Template supplies the subject |
-| `is_new_thread` | `true` on Wave 1; UNSET on Waves 2–5 | Wave 1 starts a new thread; Waves 2–5 reply within it |
-| `day` | 0, 3, 7, 12, 20 | Discovery / Curiosity / Idea / Connection / Close cadence |
-
-**Root cause of the pre-fix bug** (workflow run `e9715769`, 2026-09-11): earlier
-revisions of the instructions treated `manual_email` as "user_input goes in
-verbatim." Rox correctly reported `steps_created: 0` because there was no template
-linked — the step body source was empty. Fix landed 2026-09-14:
-`create_email_template` first, then link the returned `template_id` on the step.
-Validated by run `7bf0506b` returning `steps_created: 5` and `read_sequence`
-showing 5 `manual_email` steps at correct day offsets, `auto_send: false`.
-
-### 7.2 Why placeholders exist for Waves 2–5
-
-The sequence needs valid, enrollable steps end-to-end for the PAUSED sequence to
-be a coherent artifact. But V1 owns Wave 1 only — Waves 2–5 will be authored by a
-future PRISM wave-authoring workflow with fresh research before each wave sends.
-See [`templates/rep-notifications.md`](../templates/rep-notifications.md) for the
-exact placeholder text.
-
-The placeholder text is deliberately obviously-not-customer-copy. If a rep
-accidentally activates a placeholder wave, the prospect sees the guardrail text,
-not shipped-looking generic prose. This is a designed-in safety property, not a
-limitation.
-
-## 8. Rep notification (STEP 12)
-
-See [`templates/rep-notifications.md`](../templates/rep-notifications.md) for all
-four variants (ENROLLED, ALREADY_WORKED, COOLING_OFF, silent).
-
-## 9. Shadow diagnostic (STEP 13)
-
-Written via `rox_actions.add_html` regardless of outcome. Because `add_html`
-writes to the workflow-owner's Home, every diagnostic lands on the maintainer's
-Home — never on the executing rep's. This is the maintainer's telemetry surface
-for tuning PRISM's angle-finding over time.
-
-### 9.1 Title convention
-
-```
-🔮 PRISM diagnostic — <rep_name> — <company_name> — <decision> — <prism_run_id>
-```
-
-Decisions: `ENROLLED | ALREADY_WORKED | ALL_CANDIDATES_UNAVAILABLE | COOLING_OFF
-| HOLD:<reason> | BLOCKED:<reason> | ERROR:<message>`
-
-### 9.2 Required contents
-
-- Lineage keys at the top: `prism_run_id`, `report_id`, primary `pursuit_id` (if
-  selection completed).
-- Executing rep identity (`metadata.user.name`, `metadata.user.email`) — so the
-  maintainer knows whose instance ran.
-- Full trigger payload snapshot (nothing redacted).
-- Full candidate evaluation table: for every candidate PRISM received — name,
-  role, `pursuit_id`, `is_fresh_catch_primary`, eligibility status (AVAILABLE /
-  CLAIMED_ELSEWHERE / COOLING_OFF / INELIGIBLE:reason), research findings summary,
-  PRISM's score reasoning, final designation (PRIMARY / ALTERNATE / SKIPPED /
-  BLOCKED).
-- Explicit call-out of whether PRISM agreed with Fresh Catch's
-  `is_fresh_catch_primary`, and if not, why.
-- Claim state before/after for the primary (all status transitions).
-- Full internal Conversation Thesis (all 7 fields).
-- Wave 1 draft + Personal Selling Test result per check.
-- Template ids created (or the subset created before failure) with their names.
-- Sequence campaign id and `steps_created`, plus any per-step errors
-  `create_campaign` surfaced.
-- Any tool errors.
-
-Rendered as structured HTML (tables, headings, colored decision banner).
-
-## 10. Tool inventory
-
-### 10.1 Attached actions (workflow tools array)
-
-| Package | Action | Purpose |
-|---|---|---|
-| `rox_actions` | `lookup_account_by_domain` | Step 2 account resolution |
-| `rox_actions` | `find_contact` | Step 3 per-candidate resolution |
-| `rox_actions` | `create_contact` | Step 3 fallback for unresolved candidates with email |
-| `rox_actions` | `custom_store_get` | Step 4 claim read; step 11a re-check |
-| `rox_actions` | `custom_store_set` | Steps 11b, 11f, 11g claim writes |
-| `rox_actions` | `create_campaign` | Step 11d PAUSED sequence creation |
-| `rox_actions` | `add_contact_to_campaign` | Step 11e primary enrollment |
-| `rox_actions` | `send_notification` | Step 12 rep notification |
-| `rox_actions` | `add_html` | Step 13 shadow diagnostic to maintainer's Home |
-| `agent_outputs` | `generate_agent_response` | Step 6 research (batched via built-in `batch_generate_agent_response`) |
-| `email` | `list_emails` | Step 5 engagement check |
-
-### 10.2 Built-in runtime tools (never listed in `tools`)
-
-| Tool | Used in step | Purpose |
-|---|---|---|
-| `create_email_template` | 11c | Author each wave's template; returns `template_id` |
-| `batch_generate_agent_response` | 6 | Parallel research prompts in ONE call |
-| `plan_and_execute_rql_query`, `search_rql_catalog` | 5, 6 | Data reads (deal ownership, footprint, sequence state) |
-| `set_run_name` | 1, adjusted post-selection | Human-readable run label |
-| `add_todo`, `mark_todo_done`, `update_task_list` | throughout | Agent planning scratch |
-| `write_file`, `read_file`, `run`, `search` | 6 | Scratchpad for parsing research payloads |
-
-Built-in tools are supplied by the runtime and never appear in `<<tool:…>>` action
-tokens.
-
-### 10.3 Explicitly NOT attached
-
-- `sql.*` actions. RQL is served via the built-in `plan_and_execute_rql_query` +
-  `search_rql_catalog` — the agent discovers objects, writes the SQL, handles
-  errors itself. Never attach `sql.*`.
-- Web-search primitives. Attached via `agent_outputs.generate_agent_response`;
-  the research agent handles internet access internally.
-
-## 11. Data-model interactions (RQL surface)
-
-PRISM reads (never writes) these objects via RQL. Reads are governed by the
-executing rep's data access.
-
-| Object | Used for |
+| Gate | Checks |
 |---|---|
-| `deal` | Step 5 — open opportunity conflict on the account (`stage_name`, `updated_at`, `rox_owner_id`, `rox_company_id`) |
-| `company` | Step 6 — Couchbase footprint (`using_couchbase`, `estimated_couchbase_apps`, `couchbase_app_estimate_v2`, `couchbase_mobile_requirement`) |
-| `person` | Step 5 — engagement history (`last_email`, `last_meeting`, `opt_out_email`); step 6 — candidate context |
-| `sequence` | Step 4 & step 5 sanity — existing sequence state per person (`status`, `rox_person_id`, `name`) |
+| `AE_SENDER_POSITIONING_GATE` | Reads as an AE, not an SE / consultant / analyst / generic vendor |
+| `PLAN_FIDELITY_GATE` | Draft honors the approved Plan (same problem, same question, same entry point) |
 
-PRISM writes via actions only, never via RQL: contacts (`create_contact`),
-campaign/sequence (`create_campaign`, `add_contact_to_campaign`), claim registry
-(`custom_store_set`), rep notifications (`send_notification`), diagnostic artifact
-(`add_html`), email templates (built-in `create_email_template`).
+Plus 4 Ultimate PRISM test questions checked in the same reasoning pass:
 
-## 12. Security posture (V1) and V2 hardening
+1. Would the recipient know they were personally researched?
+2. Does the recipient have a genuine reason to respond?
+3. Would the recipient believe the sender took the time?
+4. Would a thoughtful Couchbase AE actually send this?
 
-### 12.1 V1 posture
+Evaluator output:
 
-- **Webhook auth:** OFF (`use_auth: false`). Any caller with the URL can trigger a
-  run.
-- **Rate limiting:** none at the workflow layer — Rox platform-level protections
-  only.
-- **Payload trust:** the run enforces rep-identity match against
-  `{{ metadata.user.* }}` (§3.1), which mitigates the primary abuse — a caller
-  cannot get PRISM to enroll under a different rep. But a caller could still
-  trigger PRISM runs on the correct rep's PRISM instance with crafted payloads,
-  potentially spamming the claim registry.
+```json
+{
+  "pass": true,
+  "failed_gates": [{"gate": "*", "reason": "one line"}],
+  "expected_response": "string | null"
+}
+```
 
-### 12.2 V2 hardening plan
+**Rewrite discipline:** ONE rewrite max, ONE re-evaluation. Never a second rewrite. Never re-evaluate a passing draft "to be sure". Never try "a different generation strategy". HOLD beats bad outreach.
 
-- Enable webhook signing (`use_auth: true`); Fresh Catch signs with the shared
-  secret.
-- Move `custom_store_set` writes to a CAS primitive to close the millisecond race
-  window (§5.5).
-- Introduce `cooling_off_until` writes owned by a separate sequence-lifecycle
-  workflow that subscribes to Rox sequence `COMPLETED`/`STOPPED` events.
-- Automatic failover to the next-best alternate when 11a detects the primary was
-  claimed since step 4.
-- Author Waves 2–5 adaptively via a wave-authoring workflow triggered before each
-  wave's day boundary, replacing the placeholder templates.
+## 8. Failure Modes and Retry Rules
 
-## 13. Failure taxonomy
+| Failure kind | Retry policy | Terminal state |
+|---|---|---|
+| Deterministic tool error (`custom_store`, `create_email_template`, `create_campaign`, `add_contact_to_campaign`, `lookup_account_by_domain`, `find_contact`, `create_contact`, `add_html`, `send_notification`) | 1 retry max | `ERROR:*` on 2nd failure; never spend LLM reasoning to "figure out what happened" |
+| Research call failure (`generate_agent_response`, `batch_generate_agent_response`) | 1 retry max | Step 5: `HOLD:research_tool_failure`; Step 4: treat as cache MISS, proceed with `company_background = null` |
+| Commercial evaluator returns `pass=false` | No rewrite | `HOLD:commercial_viability_failed:<gate>` |
+| Email evaluator returns `pass=false` | 1 rewrite max | `HOLD:email_quality_failed:<gate>` on 2nd failure |
+| Anything else | None | `ERROR:<message>` |
 
-| Class | Reasons | Rep notification | Claim result |
-|---|---|---|---|
-| `BLOCKED:rep_mismatch` | Payload identity ≠ runtime identity | ❌ | none written |
-| `BLOCKED:missing_required_payload_field:<name>` | Schema failure at step 1 | ❌ | none written |
-| `HOLD:account_unresolved` | Step 2 — Fresh Catch shouldn't produce this | ❌ | none written |
-| `HOLD:all_candidates_unresolved` | Step 3 — every candidate failed to resolve or create | ❌ | none written |
-| `HOLD:<per-candidate reason>` | Step 5 — engagement / opp / opt-out killed the pool | ❌ | none written |
-| `HOLD:insufficient_research` | Step 7 or 8 — no cited personal evidence AND thin category angle | ❌ | none written |
-| `HOLD:personal_selling_test_failed:<check>` | Step 10 — Wave 1 failed on second attempt | ❌ | none written |
-| `ALL_CANDIDATES_UNAVAILABLE` | Step 4 — every candidate CLAIMED_ELSEWHERE or COOLING_OFF | ✅ ALREADY_WORKED | none written |
-| `ALREADY_WORKED` | Step 11a — lost race between step 4 and 11a | ✅ ALREADY_WORKED | none written |
-| `ERROR:create_email_template_failed:wave<N>` | 11c failure | ❌ | RELEASED |
-| `ERROR:create_campaign_steps_created_<N>_expected_5` | 11d-verify failure | ❌ | RELEASED |
-| `ERROR:add_contact_to_campaign_failed` | 11e failure | ❌ | RELEASED |
-| `ERROR:finalize_claim_failed` | 11f failure | ❌ | RELEASED |
-| `ENROLLED` | Success | ✅ Sequence Ready | SEQUENCE_CREATED |
+### Claim safety
 
-Every case writes a shadow diagnostic (§9).
+If claim written in Step 11b and any subsequent 11c/11d/11d-verify/11e/11f fails: transition to `claim_status: RELEASED`, record `error_reason`. Never leave a `CLAIMED` claim without a completed enrollment. Orphaned Wave 1 templates remain in the library as unreferenced drafts (do NOT attempt to delete — no rollback path).
 
-**Invariant:** a `CLAIMED` claim without a completed sequence enrollment is never
-left in the registry. Either 11f promotes it to `SEQUENCE_CREATED`, or 11g
-transitions it to `RELEASED`.
+### Enrollment protocol ordering
 
-## 14. Observability
+Order matters. This is the anti-race-condition protocol:
 
-- Rox execution trace (per run, via `get_workflow_run_traces`): every tool call,
-  input, output, error, in order.
-- Shadow diagnostic on maintainer's Home: the primary human-readable audit trail
-  per run.
-- Claim registry itself: stateful record of every primary PRISM has touched,
-  current status, current owner.
-- Rox sequence library: every PRISM-authored sequence carries `prism_run_id` in
-  its name for grep-ability.
-- Rox email template library: every PRISM-authored template carries
-  `prism_run_id` in its name.
-- Run name convention: `🔮 PRISM — <primary_name> @ <company_name>` (set
-  post-selection via `set_run_name`).
+```
+11a. Re-check claim registry           → race detected? → ALREADY_WORKED
+11b. Write claim (CLAIMED)             → claim owned before any downstream work
+11c. Create Wave 1 template            → fail → 11g (RELEASE)
+11d. Create PAUSED sequence (is_fsd=false)
+11d-verify. steps_created == 5         → fail → 11g (RELEASE)
+11e. Enroll primary only               → fail → 11g (RELEASE)
+11f. Update claim to SEQUENCE_CREATED  → success
+11g. Release claim on any failure between 11c–11f
+```
 
-## 15. Voice standard (Wave 1)
+## 9. Rox Actions Used
 
-Plain, intelligent, conversational, specific, curious, confident, low pressure.
-Avoid: marketing jargon, buzzwords, generic AI language, exaggerated enthusiasm,
-fake familiarity, "just following up," forced product pitches. The recipient
-should think: "Huh. That's an interesting observation."
+| Action | Purpose | Steps |
+|---|---|---|
+| `rox_actions.custom_store_get` | Read claim registry, wave template config, company research cache | 1, 2, 4, 11a |
+| `rox_actions.custom_store_set` | Write claim, write company research | 4, 11b, 11f, 11g |
+| `rox_actions.lookup_account_by_domain` | Resolve account when `rox_company_id` not supplied | 2 |
+| `rox_actions.find_contact` | Resolve candidate contacts | 2 |
+| `rox_actions.create_contact` | Create missing contacts under `rox_company_id` | 2 |
+| `email.list_emails` | Detect per-contact recent engagement | 2 |
+| `agent_outputs.generate_agent_response` | Cheap triage (Step 3), company research (Step 4), Plan (Step 7), commercial evaluator (Step 8), Wave 1 draft (Step 9), email evaluator (Step 10) | 3, 4, 7, 8, 9, 10 |
+| `rox_actions.create_campaign` | Create the PAUSED 5-step sequence | 11d |
+| `rox_actions.add_contact_to_campaign` | Enroll primary only | 11e |
+| `rox_actions.send_notification` | AE and maintainer notifications | 12 |
+| `rox_actions.add_html` | Shadow diagnostic to maintainer Home | 13 |
 
-A synthetic calibration example is preserved in
-[`prompts/agent-instructions.md`](../prompts/agent-instructions.md) §15 as a
-worked reference the agent should be graded against. Run `7bf0506b` validated
-that PRISM's actual output clears this bar, but its real Wave 1 content is
-customer-identifying and is intentionally not reproduced in either document.
+Built-in runtime tools (not in the tools list): `batch_generate_agent_response` (Step 5), `create_email_template` (Step 11c), RQL tools (`search_rql_catalog`, `plan_and_execute_rql_query`, `discover_join_keys` — used ad-hoc for account/opportunity checks and Couchbase relationship lookup), `set_run_name` (Step 1, Step 6).
 
-## 16. What PRISM V1 is NOT
+### Sequence step configuration (non-negotiable)
 
-- Not a mass-email engine
-- Not a sender — every sequence is PAUSED, `is_automatic_enabled: false` on every
-  step, `is_fsd: false` at the campaign level
-- Not autonomous across waves — V1 owns Wave 1; Waves 2–5 are placeholder-only
-- Not an automatic failover engine — if the chosen primary becomes unavailable at
-  11a, V1 stops; V2 will retry against alternates
-- Not a cooling-off manager — V1 recognizes cooling-off, never writes it
-- Not a Couchbase product-pitch bot — Couchbase enters at Wave 4, and V1 doesn't
-  author Wave 4
-- Not a replacement for the rep — it hands them a sequence worth activating, or it
-  stays silent
+Every one of the 5 steps in the created sequence must have:
 
-## 17. Fresh Catch handoff contract
+- `step_type`: `"manual_email"`
+- `is_automatic_enabled`: `false`
+- `templates`: `["<template_id>"]` — exactly one entry
+- `user_input`: UNSET (ignored for templated step types)
+- `generation_type`: UNSET (default; `"agent"` would let runtime AI rewrite at send — never)
+- `step_subject_line`: UNSET (template supplies subject)
+- Wave 1: `is_new_thread: true`; Waves 2–5: unset
+- Days: `[0, 3, 7, 12, 20]`
 
-**PRISM inherits from Fresh Catch** (does not redo):
+Wave 1 uses the per-run template created in 11c. Waves 2–5 use the org-wide prebuilt templates from `wave_template_config`.
 
-- Company discovery, ICP fit, account net-new-ness
-- Compliance screen (DNC, opt-out)
-- Signal identification, source citation, why-now
-- Baseline contact discovery (2–3 candidates per company)
-- Per-contact `pursuit_id`
+`create_campaign.is_fsd: false` sets the campaign to PAUSED at the campaign level. No email can send until an AE manually reviews and activates.
 
-**PRISM decides** (Fresh Catch does not):
+## 10. Observability
 
-- Which candidate is primary
-- Deep person research per candidate
-- Whether the angle is worth a personal-selling conversation
-- Whether Fresh Catch's category angle and call opener are actually good
-- The full Conversation Thesis
-- The Wave 1 draft
-- Whether to enroll at all (`HOLD` is a valid outcome)
+### 10.1 Progressive diagnostics
 
-PRISM never overrides Fresh Catch on: compliance status, company/account identity,
-the signal's factual content, per-contact `pursuit_id` values.
+The shadow diagnostic (`add_html` to maintainer Home, Step 13) is populated progressively based on how far the run got. This is deliberate: seeing where PRISM stops in the funnel is how we tune it.
 
-## 18. Validation status
+| Stopping point | Diagnostic contents |
+|---|---|
+| Step 1 BLOCKED | Payload snapshot, decision |
+| Step 2 HOLD | + per-candidate eligibility outcome |
+| Step 6 HOLD | + triage record, ranked candidates, cache HIT/MISS, Person research object(s), Couchbase relationship, fall-through decision, step 6 outcome category |
+| Step 7 HOLD | + compact research summary (verbatim) |
+| Step 8 HOLD | + full Conversation Plan (verbatim) + commercial evaluator output (which specific gate failed and why) |
+| Step 10 HOLD | + Wave 1 draft + email evaluator output + rewrite attempt if any |
+| ENROLLED | + Wave 1 template ID, wave_template_config, sequence campaign ID, steps_created, claim state transitions |
 
-See [`CHANGELOG.md`](../CHANGELOG.md).
+Every diagnostic tails with any tool errors (with retry attempt) and maintainer-copy notification status.
+
+### 10.2 Maintainer notification
+
+For `ENROLLED` and `ALREADY_WORKED` outcomes, a separate maintainer-copy notification fires (unless the maintainer is the executing AE). The maintainer copy adds per-alternate comparative reasoning and Diagnostic Notes bullets that surface run mechanics. This lets the maintainer monitor runs across every AE's instance without opening Home for each event.
+
+### 10.3 Silent outcomes
+
+HOLD/BLOCKED/ERROR outcomes send no rep or maintainer notifications — diagnostic only. This is a design choice: an AE hearing about every HOLD would drown out the successful outcomes. The tradeoff is that an AE has no signal that Fresh Catch fired for a lead PRISM held on. Revisit if HOLD-to-AE feedback becomes needed.
+
+### 10.4 Telemetry to watch as volume grows
+
+The diagnostic structure makes these queryable across runs:
+
+- Where the funnel loses candidates (which gate fails most)
+- Cheap-triage accuracy (does `triage_selection.selected` predict the eventual `research_result` classifier?)
+- Company research cache hit rate
+- Deep-research fall-through rate (how often does #1 fail and #2 succeed?)
+- Wave 1 rewrite rate
+- Commercial evaluator failure distribution across the 11 gates
+- Race conditions at Step 11a
+
+These are the signals that will drive future tuning.
+
+## 11. Known Limitations
+
+- **Not adaptive post-enrollment.** Rox does not currently expose pre-send hooks, reply-received triggers, or sequence-lifecycle events. Waves 2–5 are prebuilt templates written by Bootstrap; PRISM does not adapt them per prospect and does not react to replies.
+- **No post-lock failover.** Once a primary is locked (Step 6 exits PASS), if Step 11a detects a race and the claim is now taken, the run exits as `ALREADY_WORKED`. It does not automatically retry against an alternate. Fall-through happens ONLY during research (Step 6).
+- **Concurrency limitation on claim registry.** `custom_store_set` is check-then-set, not compare-and-swap. Two PRISM runs firing within milliseconds could both write. Mitigated by Step 11a recheck and by writing claim before creating template/sequence, but not eliminated.
+- **RQL account-level dedup is bounded by the executing AE's data access.** A "0 deals on this account" reading in Step 2 reflects the AE's governed view, not organization-wide reality.
+- **HOLD is silent to the AE.** By design (see §10.3). Revisit when HOLD volume becomes operationally significant.
+- **Bootstrap dependency.** PRISM cannot enroll without `prism:wave_template_ids` populated. Bootstrap must run first, and each maintainer copy edit requires a Bootstrap re-run.
+- **Company research cache is background only.** Cached facts inform prompts but cannot be cited as current evidence in Wave 1 or the Plan without corroboration from Fresh Catch's signal or current person research. This is an intentional constraint against stale evidence.
+- **AE-only sender model.** SE-only enablements are out of scope. `AE_SENDER_POSITIONING_GATE` would fail confusingly for an SE-authored run.
+
+## 12. Future Work
+
+- **Pre-plan sanity check.** If Step 8 becomes the dominant HOLD point in production diagnostics, a cheap pre-plan check between Steps 6 and 7 could catch the most obvious "no viable Couchbase conversation possible" cases before spending tokens on the full 16-field Plan. Not built now — waiting for evidence.
+- **HOLD-to-AE notification.** Concise notification to the AE when PRISM holds, so they know the signal was evaluated and stopped rather than silently dropped. Deferred by design; may become necessary at scale.
+- **Sequence lifecycle companion workflow.** A separate workflow that reacts to `sequence_status` changes (`RESPONDED`, `MEETING_BOOKED`, `COMPLETED`, `STOPPED`) and updates the claim registry accordingly. PRISM's claim schema already accommodates these states; nothing writes them yet.
+- **Reply-received adaptation.** Contingent on Rox exposing a reply-received trigger. Would allow Waves 2–5 to become prospect-specific.
+- **Cross-AE triage.** Currently, `INELIGIBLE:claimed_elsewhere` treats another AE's claim as terminal for that person. A future extension could surface these as opportunities for AE-to-AE handoff or collaboration.
+- **Web research budget instrumentation.** The person research call currently self-manages its stop conditions. Explicit budget tracking (source count, search-query count, time budget) would let us tune the research cost/quality tradeoff more precisely.
+
+## Appendix A — Terminal decision reference
+
+**Per-run HOLD reasons:** `account_unresolved`, `all_candidates_unresolved`, `all_candidates_ineligible`, `insufficient_research_all_candidates_tried`, `insufficient_signal`, `conflicting_evidence`, `research_tool_failure`, `plan_construction_failed:<reason>`, `commercial_viability_failed:<gate>`, `email_quality_failed:<gate>`
+
+**Per-run BLOCKED reasons:** `rep_mismatch`, `missing_required_payload_field:<name>`, `missing_wave_template_config:<reason>`
+
+**Per-candidate INELIGIBLE reasons** (narrow the pool, don't kill the run): `active_opp_conflict` (account-level; kills all remaining), `recent_two_way_engagement`, `contact_opted_out`, `claimed_elsewhere`
+
+## Appendix B — Global Lead Protection rules
+
+- One claim per person. Primary only. Alternates never claimed.
+- First valid claim wins. Never overwrite `CLAIMED` or `SEQUENCE_CREATED`.
+- Claim before template, template before sequence. Anti-race protocol.
+- `RELEASED` is available. Treated exactly like no claim.
+- Account-level dedup is context only for cheap-triage reasoning, not a hard block on unrelated people at the same company.
+
+---
+
+*Last updated: 2026-09-22. Runtime version: 1.*
