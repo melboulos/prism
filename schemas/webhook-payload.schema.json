@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://github.com/melboulos/prism/schemas/webhook-payload.schema.json",
   "title": "🔮 PRISM webhook trigger payload",
-  "description": "Schema for trigger_data.payload as sent by Fresh Catch, one POST per company per rep. See design-spec.md §4.",
+  "description": "Schema for trigger_data.payload as sent by Fresh Catch, one POST per company per rep. See design-spec.md §6.1.",
   "type": "object",
   "required": [
     "report_id",
@@ -92,7 +92,7 @@
         "phone": { "type": "string" },
         "is_fresh_catch_primary": {
           "type": "boolean",
-          "description": "Optional. Fresh Catch's own primary guess. Advisory only — PRISM can override it in step 7."
+          "description": "Optional. Fresh Catch's own primary guess. Advisory only — PRISM's cheap triage (step 3) and deep-research classifier (step 6) can override it."
         }
       }
     }

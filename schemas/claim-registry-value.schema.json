@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://github.com/melboulos/prism/schemas/claim-registry-value.schema.json",
   "title": "🔮 PRISM claim registry value",
-  "description": "Schema for the value stored at custom_store key prism:claim:<rox_person_id>, org-scoped. One claim per person; alternates are never claimed. See design-spec.md §5.",
+  "description": "Schema for the value stored at custom_store key prism:claim:<rox_person_id>, org-scoped. One claim per person; alternates are never claimed. See design-spec.md §6.3.",
   "type": "object",
   "required": [
     "prism_run_id",
@@ -36,7 +36,7 @@
     "sequence_status": {
       "type": ["string", "null"],
       "enum": ["PAUSED", "ACTIVE", "RESPONDED", "MEETING_BOOKED", "COMPLETED", "STOPPED", null],
-      "description": "Null until claim_status is SEQUENCE_CREATED, then starts at PAUSED."
+      "description": "Null until claim_status is SEQUENCE_CREATED, then starts at PAUSED. PRISM itself only ever writes PAUSED; other values are readable but written by a future sequence-lifecycle companion workflow (design-spec.md §12)."
     },
     "claim_timestamp": {
       "type": "string",
@@ -52,12 +52,7 @@
     },
     "error_reason": {
       "type": "string",
-      "description": "Present only when claim_status is RELEASED via the 11g failure path. Free-text error identifier, e.g. create_email_template_failed:wave3."
-    },
-    "cooling_off_until": {
-      "type": "string",
-      "format": "date-time",
-      "description": "V1 reads this field if present (see design-spec.md §5.6) but never writes it. Ownership moves to a future sequence-lifecycle workflow in V2."
+      "description": "Present only when claim_status is RELEASED via the 11g failure path. Free-text error identifier, e.g. create_email_template_failed:wave1."
     }
   }
 }
