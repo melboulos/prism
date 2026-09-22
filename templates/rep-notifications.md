@@ -1,7 +1,7 @@
 # 🔮 PRISM — Rep notification templates (STEP 12)
 
 Sent via `rox_actions.send_notification`. Body format: markdown. Cross-reference:
-[`../docs/design-spec.md`](../docs/design-spec.md) §10.2, §10.3, Appendix A.
+[`../docs/design-spec.md`](../docs/design-spec.md) §6.2, §10.2, §10.3, Appendix A.
 
 Two audiences per notifying outcome:
 
@@ -116,13 +116,36 @@ under a mismatched or malformed identity; never surface an internal HOLD
 reasoning chain to a rep who didn't ask for it (see design-spec.md §12,
 "HOLD-to-AE notification" — deferred by design, may become necessary at scale).
 
-## Wave 2–5 placeholder body
+## Wave 2–5 placeholder body — canonical text (cross-repo contract)
 
-Waves 2–5 are org-wide prebuilt templates authored by PRISM Bootstrap
-(`prism:wave_template_ids`), not created per PRISM run. Their content and voice
-standard are Bootstrap's responsibility, not this file's — see the Bootstrap
-maintainer documentation. PRISM's only interaction with them at Step 11c is
-reading their template IDs and linking them onto sequence steps 2–5 unmodified.
+Waves 2–5 are org-wide prebuilt templates authored once by **PRISM Bootstrap**
+(a separate, maintainer-run process) and referenced by ID via the org
+`custom_store` key `prism:wave_template_ids` (design-spec.md §6.2). PRISM itself
+does not create these templates per run — it only reads their IDs at Step 1
+preflight and links them onto sequence steps 2–5 at Step 11c.
+
+Because Bootstrap is out of this repo's direct control, this file preserves the
+exact required guardrail text as PRISM's contract with Bootstrap: whatever
+Bootstrap writes into any Wave 2–5 template body, until that wave is genuinely
+reauthored with real research, MUST be this text, verbatim — not softened,
+shortened, or paraphrased:
+
+```
+[PRISM V1 placeholder — Wave <N> (<wave_name>) will be reauthored by a future
+PRISM wave-authoring workflow with fresh research before send. Do not activate
+this wave until then.]
+```
+
+Rationale: if a rep accidentally activates a not-yet-reauthored wave, the
+prospect must see obvious internal guardrail language, not copy that reads as
+shipped, customer-ready prose. This is a designed-in safety property, not a
+placeholder-quality issue — hence it is specified here exactly, rather than
+described in prose, so it survives edits to either repo without silent drift.
+
+If Bootstrap's own documentation is later confirmed to pin this text down
+authoritatively and keep it in sync with this file, this section can defer to
+that source instead of duplicating it. As of this writing, no such
+authoritative source was found, so this file is the canonical copy.
 
 Wave names by position: Wave 2 = Curiosity, Wave 3 = Idea, Wave 4 = Connection,
 Wave 5 = Close (day offsets 3, 7, 12, 20 respectively — Wave 1 is day 0).

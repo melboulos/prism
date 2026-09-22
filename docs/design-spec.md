@@ -214,7 +214,7 @@ If either mismatches, Fresh Catch has POSTed to the wrong AE's instance. Abort w
 | Key | Scope | Writer | Reader | Purpose |
 |---|---|---|---|---|
 | `prism_webhooks_by_rep` | org | maintainer (manual) | Fresh Catch | Route AE → PRISM webhook URL |
-| `prism:wave_template_ids` | org | PRISM Bootstrap | PRISM (Step 1 preflight) | Waves 2–5 template IDs |
+| `prism:wave_template_ids` | org | PRISM Bootstrap | PRISM (Step 1 preflight) | Waves 2–5 template IDs. Cross-repo contract: until a wave is genuinely reauthored with real research, its template body MUST use the exact guardrail placeholder text specified in [`templates/rep-notifications.md`](../templates/rep-notifications.md) §"Wave 2–5 placeholder body" — not softened, shortened, or paraphrased. |
 | `prism:claim:<rox_person_id>` | org | PRISM (Steps 11b, 11f, 11g) | PRISM (Steps 2, 11a), other PRISM instances | Global lead protection registry |
 | `prism:company_research:<domain>` | org | PRISM (Step 4 MISS) | PRISM (Step 4) | Company background cache, 30-day TTL |
 
